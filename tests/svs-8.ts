@@ -603,4 +603,277 @@ describe("svs-8 (Multi Asset Basket)", () => {
       console.log("correctly rejected wrong mint in quintuplet");
     }
   });
+
+  it("update_weights: happy path", async () => {
+    // Create a fresh vault with known weights
+    const VAULT_ID_W = new BN(888);
+    const [vaultW] = PublicKey.findProgramAddressSync(
+      [Buffer.from("multi_vault"), VAULT_ID_W.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    const [sharesMintW] = PublicKey.findProgramAddressSync(
+      [Buffer.from("shares"), vaultW.toBuffer()],
+      program.programId
+    );
+    const [assetEntryW] = PublicKey.findProgramAddressSync(
+      [Buffer.from("asset_entry"), vaultW.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const [oracleW] = PublicKey.findProgramAddressSync(
+      [Buffer.from("oracle_price"), vaultW.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const assetVaultW = Keypair.generate().publicKey;
+
+    await program.methods.initialize(VAULT_ID_W, 6)
+      .accountsPartial({ authority: user.publicKey, sharesMint: sharesMintW, tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .rpc();
+
+    await program.methods.addAsset(10_000) // 100% weight
+      .accountsPartial({ vault: vaultW, authority: user.publicKey, assetMint: mintA, oracle: anchor.web3.Keypair.generate().publicKey, assetEntry: assetEntryW, assetVault: assetVaultW, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .signers([assetVaultW]).rpc();
+
+    // No need to set oracle since there's only one asset at 100%
+
+    // Update weight - since there's only one asset, it must be 10000 bps
+    await program.methods.updateWeights(10_000)
+      .accountsPartial({ vault: vaultW, authority: user.publicKey, assetEntry: assetEntryW })
+      .rpc();
+
+    const entry = await program.account.assetEntry.fetch(assetEntryW);
+    expect(entry.targetWeightBps).to.equal(10_000);
+    console.log("correctly updated weights");
+  });
+
+  it("update_weights: rejects non-authority", async () => {
+    const wrongUser = Keypair.generate();
+    try {
+      await program.methods.updateWeights(5_000)
+        .accountsPartial({ vault: vaultPda, authority: wrongUser.publicKey, assetEntry: assetEntryA })
+        .rpc();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e.message).to.include("Error");
+      console.log("correctly rejected update_weights from non-authority");
+    }
+  });
+
+  it("update_weights: rejects invalid total (must sum to 10000)", async () => {
+    try {
+      // Asset A is at 5000, trying to set it to 8000 (total would be 13000)
+      await program.methods.updateWeights(8_000)
+        .accountsPartial({ vault: vaultPda, authority: user.publicKey, assetEntry: assetEntryA })
+        .remainingAccounts([
+          { pubkey: assetEntryB, isWritable: false, isSigner: false },
+        ])
+        .rpc();
+      expect.fail("should have thrown");
+    } catch (e) {
+      const msg = e.logs ? e.logs.join(" ") : e.message;
+      expect(msg).to.include("InvalidWeight");
+      console.log("correctly rejected invalid weight total");
+    }
+  });
+
+  it("remove_asset: happy path with zero balance", async () => {
+    // Create a fresh vault with one asset
+    const VAULT_ID_R = new BN(777);
+    const [vaultR] = PublicKey.findProgramAddressSync(
+      [Buffer.from("multi_vault"), VAULT_ID_R.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    const [sharesMintR] = PublicKey.findProgramAddressSync(
+      [Buffer.from("shares"), vaultR.toBuffer()],
+      program.programId
+    );
+    const [assetEntryR] = PublicKey.findProgramAddressSync(
+      [Buffer.from("asset_entry"), vaultR.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const assetVaultR = Keypair.generate().publicKey;
+
+    await program.methods.initialize(VAULT_ID_R, 6)
+      .accountsPartial({ authority: user.publicKey, sharesMint: sharesMintR, tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .rpc();
+
+    await program.methods.addAsset(10_000)
+      .accountsPartial({ vault: vaultR, authority: user.publicKey, assetMint: mintA, oracle: anchor.web3.Keypair.generate().publicKey, assetEntry: assetEntryR, assetVault: assetVaultR, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .signers([assetVaultR]).rpc();
+
+    const vaultBefore = await program.account.multiAssetVault.fetch(vaultR);
+    expect(vaultBefore.numAssets).to.equal(1);
+
+    // Remove the asset (vault has zero balance)
+    await program.methods.removeAsset()
+      .accountsPartial({
+        vault: vaultR,
+        authority: user.publicKey,
+        assetEntry: assetEntryR,
+        assetVault: assetVaultR,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .rpc();
+
+    const vaultAfter = await program.account.multiAssetVault.fetch(vaultR);
+    expect(vaultAfter.numAssets).to.equal(0);
+    console.log("correctly removed asset with zero balance");
+  });
+
+  it("remove_asset: rejects non-authority", async () => {
+    const wrongUser = Keypair.generate();
+    try {
+      await program.methods.removeAsset()
+        .accountsPartial({
+          vault: vaultPda,
+          authority: wrongUser.publicKey,
+          assetEntry: assetEntryA,
+          assetVault: assetVaultA,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      expect.fail("should have thrown");
+    } catch (e) {
+      expect(e.message).to.include("Error");
+      console.log("correctly rejected remove_asset from non-authority");
+    }
+  });
+
+  it("remove_asset: rejects non-empty vault", async () => {
+    // Use vaultPda which has assetVaultA with funds
+    try {
+      await program.methods.removeAsset()
+        .accountsPartial({
+          vault: vaultPda,
+          authority: user.publicKey,
+          assetEntry: assetEntryA,
+          assetVault: assetVaultA,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .remainingAccounts([
+          { pubkey: assetEntryB, isWritable: true, isSigner: false },
+        ])
+        .rpc();
+      expect.fail("should have thrown");
+    } catch (e) {
+      const msg = e.logs ? e.logs.join(" ") : e.message;
+      expect(msg).to.include("AssetVaultNotEmpty");
+      console.log("correctly rejected remove_asset with non-empty vault");
+    }
+  });
+
+  it("redeem_single: happy path", async () => {
+    const VAULT_ID_RS = new BN(666);
+    const [vaultRS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("multi_vault"), VAULT_ID_RS.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    const [sharesMintRS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("shares"), vaultRS.toBuffer()],
+      program.programId
+    );
+    const [assetEntryRS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("asset_entry"), vaultRS.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const [oracleRS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("oracle_price"), vaultRS.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const assetVaultRS = Keypair.generate().publicKey;
+
+    await program.methods.initialize(VAULT_ID_RS, 6)
+      .accountsPartial({ authority: user.publicKey, sharesMint: sharesMintRS, tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .rpc();
+
+    await program.methods.addAsset(10_000)
+      .accountsPartial({ vault: vaultRS, authority: user.publicKey, assetMint: mintA, oracle: anchor.web3.Keypair.generate().publicKey, assetEntry: assetEntryRS, assetVault: assetVaultRS, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .signers([assetVaultRS]).rpc();
+
+    await program.methods.updateOracle(new BN(1_000_000_000))
+      .accountsPartial({ vault: vaultRS, assetMint: mintA, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    const userSharesRS = await getOrCreateAssociatedTokenAccount(
+      provider.connection, user.payer, sharesMintRS, user.publicKey, false, undefined, undefined, TOKEN_2022_PROGRAM_ID
+    );
+
+    // Deposit
+    await program.methods.depositSingle(new BN(1_000_000), new BN(0))
+      .accountsPartial({ user: user.publicKey, vault: vaultRS, assetEntry: assetEntryRS, assetMint: mintA, oraclePrice: oracleRS, assetVaultAccount: assetVaultRS, sharesMint: sharesMintRS, userAssetAccount: userAtaA, userSharesAccount: userSharesRS.address, tokenProgram: TOKEN_PROGRAM_ID, sharesTokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    const mintBefore = await getMint(provider.connection, sharesMintRS, undefined, TOKEN_2022_PROGRAM_ID);
+    const sharesToRedeem = new anchor.BN(Number(mintBefore.supply) / 2);
+    expect(sharesToRedeem.toNumber()).to.be.greaterThan(0);
+
+    const userAssetBefore = await getAccount(provider.connection, userAtaA, undefined, TOKEN_PROGRAM_ID);
+
+    await program.methods.redeemSingle(sharesToRedeem, new BN(0))
+      .accounts({ user: user.publicKey, vault: vaultRS, assetEntry: assetEntryRS, assetMint: mintA, oraclePrice: oracleRS, assetVaultAccount: assetVaultRS, userAssetAccount: userAtaA, sharesMint: sharesMintRS, userSharesAccount: userSharesRS.address, tokenProgram: TOKEN_PROGRAM_ID, sharesTokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    const mintAfter = await getMint(provider.connection, sharesMintRS, undefined, TOKEN_2022_PROGRAM_ID);
+    expect(Number(mintAfter.supply)).to.be.lessThan(Number(mintBefore.supply));
+    console.log("correctly redeemed single asset");
+  });
+
+  it("redeem_single: rejects slippage", async () => {
+    const VAULT_ID_RSS = new BN(555);
+    const [vaultRSS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("multi_vault"), VAULT_ID_RSS.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    );
+    const [sharesMintRSS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("shares"), vaultRSS.toBuffer()],
+      program.programId
+    );
+    const [assetEntryRSS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("asset_entry"), vaultRSS.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const [oracleRSS] = PublicKey.findProgramAddressSync(
+      [Buffer.from("oracle_price"), vaultRSS.toBuffer(), mintA.toBuffer()],
+      program.programId
+    );
+    const assetVaultRSS = Keypair.generate().publicKey;
+
+    await program.methods.initialize(VAULT_ID_RSS, 6)
+      .accountsPartial({ authority: user.publicKey, sharesMint: sharesMintRSS, tokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .rpc();
+
+    await program.methods.addAsset(10_000)
+      .accountsPartial({ vault: vaultRSS, authority: user.publicKey, assetMint: mintA, oracle: anchor.web3.Keypair.generate().publicKey, assetEntry: assetEntryRSS, assetVault: assetVaultRSS, tokenProgram: TOKEN_PROGRAM_ID, systemProgram: SystemProgram.programId, rent: anchor.web3.SYSVAR_RENT_PUBKEY })
+      .signers([assetVaultRSS]).rpc();
+
+    await program.methods.updateOracle(new BN(1_000_000_000))
+      .accountsPartial({ vault: vaultRSS, assetMint: mintA, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    const userSharesRSS = await getOrCreateAssociatedTokenAccount(
+      provider.connection, user.payer, sharesMintRSS, user.publicKey, false, undefined, undefined, TOKEN_2022_PROGRAM_ID
+    );
+
+    // Deposit
+    await program.methods.depositSingle(new BN(1_000_000), new BN(0))
+      .accountsPartial({ user: user.publicKey, vault: vaultRSS, assetEntry: assetEntryRSS, assetMint: mintA, oraclePrice: oracleRSS, assetVaultAccount: assetVaultRSS, sharesMint: sharesMintRSS, userAssetAccount: userAtaA, userSharesAccount: userSharesRSS.address, tokenProgram: TOKEN_PROGRAM_ID, sharesTokenProgram: TOKEN_2022_PROGRAM_ID, associatedTokenProgram: anchor.utils.token.ASSOCIATED_PROGRAM_ID, systemProgram: SystemProgram.programId })
+      .rpc();
+
+    const mintRSS = await getMint(provider.connection, sharesMintRSS, undefined, TOKEN_2022_PROGRAM_ID);
+    const sharesToRedeem = new anchor.BN(Number(mintRSS.supply) / 2);
+
+    // Set min_assets_out extremely high to trigger slippage
+    try {
+      await program.methods.redeemSingle(sharesToRedeem, new BN(999_999_999_999))
+        .accounts({ user: user.publicKey, vault: vaultRSS, assetEntry: assetEntryRSS, assetMint: mintA, oraclePrice: oracleRSS, assetVaultAccount: assetVaultRSS, userAssetAccount: userAtaA, sharesMint: sharesMintRSS, userSharesAccount: userSharesRSS.address, tokenProgram: TOKEN_PROGRAM_ID, sharesTokenProgram: TOKEN_2022_PROGRAM_ID, systemProgram: SystemProgram.programId })
+        .rpc();
+      expect.fail("should have thrown");
+    } catch (e) {
+      const msg = e.logs ? e.logs.join(" ") : e.message;
+      expect(msg).to.include("SlippageExceeded");
+      console.log("correctly rejected redeem_single with slippage");
+    }
+  });
 });

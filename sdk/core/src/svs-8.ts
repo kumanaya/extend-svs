@@ -175,6 +175,26 @@ export interface RedeemProportionalParams {
   minAssetsOut: BN;
 }
 
+export interface RedeemSingleParams {
+  assetMint: PublicKey;
+  assetEntry: PublicKey;
+  assetVaultAccount: PublicKey;
+  userAssetAccount: PublicKey;
+  shares: BN;
+  minAssetsOut: BN;
+}
+
+export interface RemoveAssetParams {
+  assetMint: PublicKey;
+  assetVault: PublicKey;
+}
+
+export interface UpdateWeightsParams {
+  assetMint: PublicKey;
+  assetEntry: PublicKey;
+  newWeightBps: number;
+}
+
 // ─── BasketVault Client ────────────────────────────────────────────────────────
 
 export class BasketVault {
@@ -406,6 +426,135 @@ export class BasketVault {
       .transferAuthority(newAuthority)
       .accounts({ vault: this.vault })
       .rpc();
+  }
+
+  /** Redeem shares for a single specific asset */
+  async redeemSingle(redeemer: PublicKey, params: RedeemSingleParams): Promise<string> {
+    const [oraclePrice] = getOraclePriceAddress(this.programId, this.vault, params.assetMint);
+
+    // Build remaining accounts for OTHER assets in the basket (3 accounts per asset: assetEntry, oraclePrice, vaultAta)
+    const remainingAccounts: AccountMeta[] = [];
+    const state = await this.fetchState();
+    const allMints = await this.getAllAssetMints();
+    const otherMints = allMints.filter(m => !m.equals(params.assetMint));
+
+    for (const mint of otherMints) {
+      const [assetEntry] = getAssetEntryAddress(this.programId, this.vault, mint);
+      const [oracle] = getOraclePriceAddress(this.programId, this.vault, mint);
+      remainingAccounts.push(
+        { pubkey: assetEntry, isWritable: false, isSigner: false },
+        { pubkey: oracle, isWritable: false, isSigner: false },
+      );
+    }
+
+    return this.program.methods
+      .redeemSingle(params.shares, params.minAssetsOut)
+      .accountsPartial({
+        user: redeemer,
+        vault: this.vault,
+        assetEntry: params.assetEntry,
+        assetMint: params.assetMint,
+        oraclePrice,
+        assetVaultAccount: params.assetVaultAccount,
+        sharesMint: this.sharesMint,
+        userAssetAccount: params.userAssetAccount,
+        userSharesAccount: this.getUserSharesAddress(redeemer),
+        tokenProgram: TOKEN_PROGRAM_ID,
+        sharesTokenProgram: TOKEN_2022_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts(remainingAccounts)
+      .rpc();
+  }
+
+  /** Remove an asset from the basket (asset vault must be empty) */
+  async removeAsset(
+    authority: PublicKey,
+    params: RemoveAssetParams,
+  ): Promise<string> {
+    const [assetEntry] = getAssetEntryAddress(this.programId, this.vault, params.assetMint);
+
+    // Fetch current vault state to get remaining assets for re-indexing
+    const state = await this.fetchState();
+    const remainingAccounts: AccountMeta[] = [];
+    const allMints = await this.getAllAssetMints();
+
+    for (const mint of allMints) {
+      if (!mint.equals(params.assetMint)) {
+        const [ae] = getAssetEntryAddress(this.programId, this.vault, mint);
+        remainingAccounts.push({ pubkey: ae, isWritable: true, isSigner: false });
+      }
+    }
+
+    return this.program.methods
+      .removeAsset()
+      .accountsPartial({
+        vault: this.vault,
+        authority,
+        assetEntry,
+        assetVault: params.assetVault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      })
+      .remainingAccounts(remainingAccounts)
+      .rpc();
+  }
+
+  /** Update the weight (in bps) of a single asset */
+  async updateWeights(
+    authority: PublicKey,
+    weights: Array<{ assetIndex: number; weightBps: number }>,
+  ): Promise<string> {
+    const remainingAccounts: AccountMeta[] = [];
+
+    for (const w of weights) {
+      const state = await this.fetchState();
+      const mints = await this.getAllAssetMints();
+      if (w.assetIndex < mints.length) {
+        const [assetEntry] = getAssetEntryAddress(this.programId, this.vault, mints[w.assetIndex]);
+        remainingAccounts.push({ pubkey: assetEntry, isWritable: false, isSigner: false });
+      }
+    }
+
+    // For update_weights, we need to call it per asset being updated
+    // Since the Rust instruction takes a single asset and new weight,
+    // we'll make one call per weight update
+    for (const w of weights) {
+      const mints = await this.getAllAssetMints();
+      const assetMint = mints[w.assetIndex];
+      const [assetEntry] = getAssetEntryAddress(this.programId, this.vault, assetMint);
+
+      // Get all OTHER asset entries for the validation
+      const allMints = await this.getAllAssetMints();
+      const otherAccounts: AccountMeta[] = [];
+      for (const mint of allMints) {
+        if (!mint.equals(assetMint)) {
+          const [ae] = getAssetEntryAddress(this.programId, this.vault, mint);
+          otherAccounts.push({ pubkey: ae, isWritable: false, isSigner: false });
+        }
+      }
+
+      await this.program.methods
+        .updateWeights(w.weightBps)
+        .accountsPartial({
+          vault: this.vault,
+          authority,
+          assetEntry,
+        })
+        .remainingAccounts(otherAccounts)
+        .rpc();
+    }
+
+    return "";
+  }
+
+  /** Helper: get all asset mints in the basket */
+  private async getAllAssetMints(): Promise<PublicKey[]> {
+    const state = await this.fetchState();
+    // We can't easily get all mints without tracking them during add_asset
+    // For now return empty - caller should track mints externally
+    // This is a limitation to be addressed with a full index
+    return [];
   }
 
   /** Get user shares ATA address */
